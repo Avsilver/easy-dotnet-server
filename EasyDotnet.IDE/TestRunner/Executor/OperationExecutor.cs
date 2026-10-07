@@ -137,13 +137,18 @@ public class OperationExecutor(
           }
           else
           {
-            var baseId = NodeIdBuilder.Method(parentId, discovered.MethodName);
+            // xUnit v2 reports the full FQN as DisplayName, so discovered.MethodName
+            // can be "Namespace.Class.Method". The stable id must use the short method
+            // name to stay identical to the id syncFile/source registration produces,
+            // otherwise the id changes on the first rediscovery and clients (neotest)
+            // hold a stale id.
+            var baseId = NodeIdBuilder.Method(parentId, shortMethodName);
             subcaseCounters.TryGetValue(baseId, out var seenCount);
             subcaseCounters[baseId] = seenCount + 1;
             if (seenCount > 0)
             {
               var suffix = $"[{seenCount}]";
-              methodNodeId = NodeIdBuilder.Method(parentId, discovered.MethodName + suffix);
+              methodNodeId = NodeIdBuilder.Method(parentId, shortMethodName + suffix);
               shortName = shortMethodName + suffix;
             }
             else
