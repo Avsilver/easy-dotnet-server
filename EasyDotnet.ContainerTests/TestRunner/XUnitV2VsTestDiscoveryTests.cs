@@ -40,6 +40,10 @@ public abstract class XUnitV2VsTestDiscoveryTests<TContainer> : TestRunnerTestBa
       var methods = Children(classes[0].Id).Where(c => c.Type.Type == NodeTypeNames.TestMethod).ToList();
       Assert.Single(methods);
       Assert.Equal("M", methods[0].DisplayName);
+      // xUnit v2 reports the FQN as DisplayName; the stable id must still use the
+      // short method name so it matches syncFile/source registration and survives
+      // rediscovery.
+      Assert.EndsWith("::method:M", methods[0].Id);
     }
   }
 

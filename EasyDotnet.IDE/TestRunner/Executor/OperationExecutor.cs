@@ -28,7 +28,32 @@ public class OperationExecutor(
         .Select(n => n.Id)
         .ToHashSet();
 
+    // Source sync can register a new test before it exists in the current build.
+    // Keep those provisional nodes (and their namespace/class parents) while the
+    // adapter tree is refreshed, so a background discover cannot make them vanish.
+    var sourceNodes = new Dictionary<string, TestNode>();
+    var sourceNativeIds = new Dictionary<string, string>();
+    foreach (var probable in registry.GetDescendants(projectNodeId).Where(n => n.Type is NodeType.ProbableTest).ToList())
+    {
+      sourceNodes[probable.Id] = probable;
+      if (registry.GetNativeId(probable.Id) is { } nativeId)
+        sourceNativeIds[probable.Id] = nativeId;
+
+      var probableParentId = probable.ParentId;
+      while (probableParentId is not null && probableParentId != projectNodeId)
+      {
+        var parent = registry.Get(probableParentId);
+        if (parent is null)
+          break;
+        if (parent.Type is NodeType.Namespace or NodeType.TestClass)
+          sourceNodes[parent.Id] = parent;
+        probableParentId = parent.ParentId;
+      }
+    }
+
     registry.ClearDescendants(projectNodeId);
+    foreach (var node in sourceNodes.Values.OrderBy(n => SourceNodeDepth(n, sourceNodes)))
+      registry.Register(node, sourceNativeIds.GetValueOrDefault(node.Id));
 
     var adapter = adapterResolver.Resolve(project);
     var emittedNamespaces = new HashSet<string>();
@@ -137,13 +162,18 @@ public class OperationExecutor(
           }
           else
           {
-            var baseId = NodeIdBuilder.Method(parentId, discovered.MethodName);
+            // xUnit v2 reports the full FQN as DisplayName, so discovered.MethodName
+            // can be "Namespace.Class.Method". The stable id must use the short method
+            // name to stay identical to the id syncFile/source registration produces,
+            // otherwise the id changes on the first rediscovery and clients (neotest)
+            // hold a stale id.
+            var baseId = NodeIdBuilder.Method(parentId, shortMethodName);
             subcaseCounters.TryGetValue(baseId, out var seenCount);
             subcaseCounters[baseId] = seenCount + 1;
             if (seenCount > 0)
             {
               var suffix = $"[{seenCount}]";
-              methodNodeId = NodeIdBuilder.Method(parentId, discovered.MethodName + suffix);
+              methodNodeId = NodeIdBuilder.Method(parentId, shortMethodName + suffix);
               shortName = shortMethodName + suffix;
             }
             else
@@ -185,10 +215,25 @@ public class OperationExecutor(
       if (!IsFSharpProject(project))
         CollapseNamespaces(projectNodeId, pendingEmit);
 
+      // If normal discovery found a provisional source test, prefer the framework
+      // node and its native id. Otherwise leave the probable visible until a later build.
+      foreach (var probable in registry.GetDescendants(projectNodeId).Where(n => n.Type is NodeType.ProbableTest).ToList())
+      {
+        var successor = pendingEmit.FirstOrDefault(n =>
+          n.Type is NodeType.TestMethod or NodeType.TheoryGroup
+          && string.Equals(n.FilePath, probable.FilePath, StringComparison.OrdinalIgnoreCase)
+          && string.Equals(n.ParentId, probable.ParentId, StringComparison.Ordinal)
+          && string.Equals(n.DisplayName, probable.DisplayName, StringComparison.Ordinal)
+        );
+        if (successor is null)
+          continue;
+        registry.RemoveSubtree(probable.Id);
+      }
+
       foreach (var node in pendingEmit.ToList())
         await dispatcher.SendRegisterTestAsync(node, token.OperationId);
 
-      var postDiscoveryIds = pendingEmit.Select(n => n.Id).ToHashSet();
+      var postDiscoveryIds = registry.GetDescendants(projectNodeId).Select(n => n.Id).ToHashSet();
       foreach (var orphanId in preDiscoveryIds)
       {
         if (!postDiscoveryIds.Contains(orphanId))
@@ -205,11 +250,26 @@ public class OperationExecutor(
     {
       logger.LogWarning(ex, "Discovery failed for project {Project} — DLL may be missing or stale", project.ProjectName);
       registry.ClearDescendants(projectNodeId);
+      foreach (var node in sourceNodes.Values.OrderBy(n => SourceNodeDepth(n, sourceNodes)))
+        registry.Register(node, sourceNativeIds.GetValueOrDefault(node.Id));
       foreach (var orphanId in preDiscoveryIds)
       {
-        await dispatcher.SendRemoveTestAsync(orphanId, token.OperationId);
+        if (!sourceNodes.ContainsKey(orphanId))
+          await dispatcher.SendRemoveTestAsync(orphanId, token.OperationId);
       }
     }
+  }
+
+  private static int SourceNodeDepth(TestNode node, IReadOnlyDictionary<string, TestNode> sourceNodes)
+  {
+    var depth = 0;
+    var parentId = node.ParentId;
+    while (parentId is not null && sourceNodes.TryGetValue(parentId, out var parent))
+    {
+      depth++;
+      parentId = parent.ParentId;
+    }
+    return depth;
   }
 
   private static IReadOnlyList<string> StripRootNamespace(
