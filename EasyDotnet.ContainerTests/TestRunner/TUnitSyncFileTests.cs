@@ -14,6 +14,48 @@ public abstract class TUnitSyncFileTests<TContainer> : TestRunnerTestBase<TConta
   where TContainer : ServerContainer, new()
 {
   [Fact]
+  public async Task SyncFile_NewFileAndClassCanBeRunWithoutPriorDiscovery()
+  {
+    const string initial = """
+      namespace Sample.SyncNewFile;
+      public class Existing
+      {
+          [TUnit.Core.Test]
+          public async Task ExistingTest() { await Task.CompletedTask; }
+      }
+      """;
+    const string added = """
+      namespace Sample.SyncNewFile;
+      public class Fresh
+      {
+          [TUnit.Core.Test]
+          public async Task JustAdded() { await Task.CompletedTask; }
+      }
+      """;
+
+    using var fixture = new TestProjectFixtureBuilder()
+      .WithName("Sample.TUnitSyncNewFile")
+      .WithFramework(TestFrameworkKind.TUnitMtp)
+      .WithFile("Existing.cs", initial)
+      .Build();
+
+    await InitializeTestRunnerAsync(fixture);
+
+    var path = Path.Combine(fixture.ProjectDir, "Fresh.cs");
+    await File.WriteAllTextAsync(path, added);
+    await Container.Rpc.TestRunnerSyncFileAsync(path, added, version: 1);
+
+    var classNode = Assert.Single(NodesOfType(NodeTypeNames.TestClass), n => n.DisplayName == "Fresh");
+    var probable = Assert.Single(NodesOfType(NodeTypeNames.ProbableTest), n => n.DisplayName == "JustAdded");
+    Assert.Equal(classNode.Id, probable.ParentId);
+
+    await Container.Rpc.TestRunnerRunAsync(probable.Id);
+
+    var method = Assert.Single(NodesOfType(NodeTypeNames.TestMethod), n => n.DisplayName == "JustAdded");
+    Assert.True(LastStatusKind.TryGetValue(method.Id, out var status) && status == "Passed", $"Expected new test to run successfully, got {(status ?? "<none>")}.");
+  }
+
+  [Fact]
   public async Task SyncFile_AfterInsertingLeadingBlankLines_UpdatesClassAndMethodPositions()
   {
     using var fixture = new TestProjectFixtureBuilder()

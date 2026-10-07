@@ -22,6 +22,7 @@ public record TestMethodLocation(
 public record ProbableMethod(
     string ClassName,
     string MethodName,
+    IReadOnlyList<string> NamespaceParts,
     TestMethodLocation Location
 );
 
@@ -203,7 +204,7 @@ public class TestSourceLocator
       methods[name] = loc;
 
       if (HasTestAttribute(method) && EnclosingClassName(method) is { } className)
-        probableMethods.Add(new ProbableMethod(className, name, loc));
+        probableMethods.Add(new ProbableMethod(className, name, GetNamespaceParts(method), loc));
     }
 
     foreach (var cls in root.DescendantNodes().OfType<ClassDeclarationSyntax>())
@@ -229,5 +230,20 @@ public class TestSourceLocator
     }
 
     return new ParsedFileLocations(methods, classes, probableMethods);
+  }
+
+  private static IReadOnlyList<string> GetNamespaceParts(SyntaxNode node)
+  {
+    var namespaces = new Stack<string>();
+    for (var current = node.Parent; current is not null; current = current.Parent)
+    {
+      if (current is BaseNamespaceDeclarationSyntax ns)
+      {
+        foreach (var part in ns.Name.ToString().Split('.', StringSplitOptions.RemoveEmptyEntries).Reverse())
+          namespaces.Push(part);
+      }
+    }
+
+    return [.. namespaces];
   }
 }

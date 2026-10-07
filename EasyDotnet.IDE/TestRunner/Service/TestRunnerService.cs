@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using EasyDotnet.BuildServer.Contracts;
 using EasyDotnet.IDE.BuildHost;
 using EasyDotnet.IDE.Interfaces;
@@ -27,6 +28,8 @@ public class TestRunnerService(
     ILogger<TestRunnerService> logger)
 {
   private readonly object _opSync = new();
+  private readonly ConcurrentDictionary<string, SemaphoreSlim> _syncFileGates = new(StringComparer.OrdinalIgnoreCase);
+  private readonly ConcurrentDictionary<string, int> _syncFileVersions = new(StringComparer.OrdinalIgnoreCase);
   private CancellationTokenSource? _operationCts;
   private OperationControl? _operationControl;
   private long _operationId;
@@ -588,7 +591,7 @@ public class TestRunnerService(
     return new OperationResult(Success: true);
   }
 
-  private async Task<string> EnsureProjectNodeAsync(ValidatedDotnetProject project, string solutionNodeId, long operationId)
+  private async Task<string> EnsureProjectNodeAsync(ValidatedDotnetProject project, string solutionNodeId, long? operationId)
   {
     var projectNodeId = NodeIdBuilder.Project(solutionNodeId, project.ProjectName, project.TargetFramework ?? "");
 
@@ -735,12 +738,39 @@ public class TestRunnerService(
 
   public async Task<SyncFileResult> SyncFileAsync(SyncFileRequest req)
   {
+    var key = Path.GetFullPath(req.Path).Replace('\\', '/');
+    _syncFileVersions.AddOrUpdate(key, req.Version, (_, current) => Math.Max(current, req.Version));
+    var gate = _syncFileGates.GetOrAdd(key, _ => new SemaphoreSlim(1, 1));
+    await gate.WaitAsync();
+    try
+    {
+      return await SyncFileCoreAsync(req);
+    }
+    finally
+    {
+      gate.Release();
+    }
+  }
+
+  private async Task<SyncFileResult> SyncFileCoreAsync(SyncFileRequest req)
+  {
+    if (!IsLatestSync(req))
+      return new SyncFileResult([], req.Version);
     var parsed = TestSourceLocator.ParseContent(req.Content);
     var updates = new List<LineNumberUpdateDto>();
 
     var isCSharp = req.Path.EndsWith(".cs", StringComparison.OrdinalIgnoreCase);
 
-    foreach (var node in registry.GetNodesForFile(req.Path))
+    var sourceClasses = registry.GetNodesForFile(req.Path).Where(n => n.Type is NodeType.TestClass).ToList();
+    var hasUnknownSourceClass = parsed.ProbableMethods.Any(probable =>
+      !sourceClasses.Any(node => string.Equals(node.DisplayName, probable.ClassName, StringComparison.Ordinal) && node.SignatureLine == parsed.Classes.GetValueOrDefault(probable.ClassName)?.SignatureLine)
+    );
+    if (isCSharp && hasUnknownSourceClass)
+      await RegisterSourceTestsAsync(req.Path, parsed, req.Version, req.SolutionPath);
+    if (!IsLatestSync(req))
+      return new SyncFileResult([], req.Version);
+
+    foreach (var node in registry.GetNodesForFile(req.Path).ToList())
     {
       TestMethodLocation? loc;
 
@@ -836,6 +866,225 @@ public class TestRunnerService(
     }
 
     return new SyncFileResult([.. updates], req.Version);
+  }
+
+  private bool IsLatestSync(SyncFileRequest req)
+  {
+    var key = Path.GetFullPath(req.Path).Replace('\\', '/');
+    return !_syncFileVersions.TryGetValue(key, out var latest) || req.Version >= latest;
+  }
+
+  private async Task RegisterSourceTestsAsync(string filePath, ParsedFileLocations parsed, int version, string? selectedSolutionPath)
+  {
+    var projectPath = FindNearestProjectFile(filePath);
+    if (projectPath is null)
+    {
+      logger.LogDebug("Could not find a project for test source {FilePath}", filePath);
+      return;
+    }
+
+    using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+    var projects = new List<ValidatedDotnetProject>();
+    try
+    {
+      var request = new GetProjectPropertiesBatchRequest([projectPath], "Debug");
+      await foreach (var result in buildHost.GetProjectPropertiesBatchAsync(request, timeout.Token))
+      {
+        if (result.Success && result.Project is not null)
+          projects.Add(result.Project);
+      }
+    }
+    catch (OperationCanceledException) when (timeout.IsCancellationRequested)
+    {
+      logger.LogWarning("Timed out evaluating project {ProjectPath} while syncing test source", projectPath);
+      return;
+    }
+    catch (Exception ex)
+    {
+      logger.LogWarning(ex, "Could not evaluate project {ProjectPath} while syncing test source", projectPath);
+      return;
+    }
+
+    if (projects.Count == 0)
+      return;
+
+    // A newer save may have arrived while MSBuild evaluated a newly encountered
+    // project. Avoid registering stale source; the per-file gate lets the latest
+    // request perform the final reconciliation immediately after this one.
+    var syncKey = Path.GetFullPath(filePath).Replace('\\', '/');
+    if (_syncFileVersions.TryGetValue(syncKey, out var latestVersion) && version < latestVersion)
+      return;
+
+    var selectedSolutionDir = selectedSolutionPath is not null ? Path.GetDirectoryName(Path.GetFullPath(selectedSolutionPath)) : null;
+    var solutionPath = selectedSolutionDir is not null && IsPathWithin(projectPath, selectedSolutionDir) ? selectedSolutionPath : FindNearestSolutionFile(projectPath);
+    var solutionName = solutionPath is not null ? Path.GetFileName(solutionPath) : Path.GetFileName(projectPath);
+    var solutionId = NodeIdBuilder.Solution(solutionName);
+    var solutionNode = new TestNode(
+      Id: solutionId,
+      DisplayName: solutionName,
+      ParentId: null,
+      FilePath: solutionPath ?? projectPath,
+      SignatureLine: null,
+      BodyStartLine: null,
+      EndLine: null,
+      Type: new NodeType.Solution(),
+      ProjectId: null,
+      AvailableActions: [TestAction.Run, TestAction.Invalidate]
+    );
+    if (!registry.Exists(solutionId))
+    {
+      registry.Register(solutionNode);
+      await dispatcher.SendRegisterTestAsync(solutionNode);
+    }
+
+    foreach (var project in projects)
+    {
+      var projectNodeId = await EnsureProjectNodeAsync(project, solutionId, operationId: null);
+      var rootParts = (project.Raw.RootNamespace ?? project.ProjectName).Split('.', StringSplitOptions.RemoveEmptyEntries);
+
+      foreach (var probable in parsed.ProbableMethods)
+      {
+        var namespaceNodeId = await EnsureSourceNamespaceAsync(projectNodeId, probable.NamespaceParts, rootParts);
+        var classNodeId = NodeIdBuilder.Class(namespaceNodeId, probable.ClassName);
+
+        var classLocation = parsed.Classes.GetValueOrDefault(probable.ClassName);
+        var classNode = new TestNode(
+          Id: classNodeId,
+          DisplayName: probable.ClassName,
+          ParentId: namespaceNodeId,
+          FilePath: filePath,
+          SignatureLine: classLocation?.SignatureLine,
+          BodyStartLine: classLocation?.BodyStartLine,
+          EndLine: classLocation?.EndLine,
+          Type: new NodeType.TestClass(),
+          ProjectId: projectNodeId,
+          AvailableActions: [TestAction.Run, TestAction.Debug, TestAction.GoToSource]
+        );
+
+        if (!registry.Exists(classNodeId))
+        {
+          registry.Register(classNode);
+          await dispatcher.SendRegisterTestAsync(classNode);
+        }
+        else if (classLocation is not null)
+        {
+          registry.Register(classNode);
+          await dispatcher.SendRegisterTestAsync(classNode);
+        }
+
+        var methodId = NodeIdBuilder.Method(classNodeId, probable.MethodName);
+        var fqn = BuildFqn(classNode, probable.MethodName);
+        var probableNode = new TestNode(
+          Id: methodId,
+          DisplayName: probable.MethodName,
+          ParentId: classNodeId,
+          FilePath: filePath,
+          SignatureLine: probable.Location.SignatureLine,
+          BodyStartLine: probable.Location.BodyStartLine,
+          EndLine: probable.Location.EndLine,
+          Type: new NodeType.ProbableTest(),
+          ProjectId: projectNodeId,
+          AvailableActions: [TestAction.Run, TestAction.Debug, TestAction.GoToSource]
+        );
+
+        var existing = registry.Get(methodId);
+        if (existing?.Type is NodeType.TestMethod or NodeType.TheoryGroup or NodeType.Subcase)
+          continue;
+
+        registry.Register(probableNode, nativeId: fqn);
+        await dispatcher.SendRegisterTestAsync(probableNode);
+      }
+    }
+  }
+
+  private async Task<string> EnsureSourceNamespaceAsync(string projectNodeId, IReadOnlyList<string> namespaceParts, string[] rootParts)
+  {
+    if (namespaceParts.Count == 0)
+      return projectNodeId;
+
+    var skipRoot = namespaceParts.Count >= rootParts.Length;
+    for (var i = 0; skipRoot && i < rootParts.Length; i++)
+      skipRoot = string.Equals(namespaceParts[i], rootParts[i], StringComparison.OrdinalIgnoreCase);
+
+    var firstDisplayIndex = skipRoot ? rootParts.Length : 0;
+    if (firstDisplayIndex == namespaceParts.Count)
+      return projectNodeId;
+
+    string? existingId = null;
+    var existingCount = 0;
+    for (var count = 1; count <= namespaceParts.Count; count++)
+    {
+      var candidate = NodeIdBuilder.Namespace(projectNodeId, namespaceParts.Take(count).ToArray());
+      if (registry.Get(candidate)?.Type is NodeType.Namespace)
+      {
+        existingId = candidate;
+        existingCount = count;
+      }
+    }
+
+    var suffix = namespaceParts.Skip(existingCount).ToArray();
+    if (suffix.Length == 0)
+      return existingId ?? projectNodeId;
+
+    var id = NodeIdBuilder.Namespace(projectNodeId, namespaceParts);
+    var display = string.Join('.', suffix.Skip(Math.Max(0, firstDisplayIndex - existingCount)));
+    var node = new TestNode(
+      Id: id,
+      DisplayName: display,
+      ParentId: existingId ?? projectNodeId,
+      FilePath: null,
+      SignatureLine: null,
+      BodyStartLine: null,
+      EndLine: null,
+      Type: new NodeType.Namespace(),
+      ProjectId: projectNodeId,
+      AvailableActions: [TestAction.Run, TestAction.Debug]
+    );
+    if (!registry.Exists(id))
+    {
+      registry.Register(node);
+      await dispatcher.SendRegisterTestAsync(node);
+    }
+    return id;
+  }
+
+  private static string? FindNearestProjectFile(string filePath)
+  {
+    var directory = Path.GetDirectoryName(Path.GetFullPath(filePath));
+    while (directory is not null)
+    {
+      var projects = Directory.EnumerateFiles(directory, "*.csproj", SearchOption.TopDirectoryOnly).OrderBy(path => path, StringComparer.OrdinalIgnoreCase).ToList();
+      if (projects.Count > 0)
+      {
+        var directoryName = Path.GetFileName(directory);
+        return projects.FirstOrDefault(path => string.Equals(Path.GetFileNameWithoutExtension(path), directoryName, StringComparison.OrdinalIgnoreCase)) ?? projects[0];
+      }
+      directory = Directory.GetParent(directory)?.FullName;
+    }
+    return null;
+  }
+
+  private static string? FindNearestSolutionFile(string projectPath)
+  {
+    var directory = Path.GetDirectoryName(Path.GetFullPath(projectPath));
+    while (directory is not null)
+    {
+      var solution = Directory
+        .EnumerateFiles(directory, "*.sln", SearchOption.TopDirectoryOnly)
+        .Concat(Directory.EnumerateFiles(directory, "*.slnx", SearchOption.TopDirectoryOnly))
+        .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+        .FirstOrDefault();
+      if (solution is not null)
+        return solution;
+      directory = Directory.GetParent(directory)?.FullName;
+    }
+    return null;
+  }
+
+  private static bool IsPathWithin(string path, string directory)
+  {
+    var relative = Path.GetRelativePath(Path.GetFullPath(directory), Path.GetFullPath(path));
+    return !Path.IsPathRooted(relative) && relative != ".." && !relative.StartsWith($"..{Path.DirectorySeparatorChar}", StringComparison.Ordinal);
   }
 
   /// <summary>
@@ -1331,7 +1580,7 @@ public record StackFrameDto(string OriginalText, string? File, int? Line, bool I
   }
 }
 
-public record SyncFileRequest(string Path, string Content, int Version);
+public record SyncFileRequest(string Path, string Content, int Version, string? SolutionPath = null);
 public record SyncFileResult(LineNumberUpdateDto[] Updates, int Version);
 public record LineNumberUpdateDto(string Id, int SignatureLine, int BodyStartLine, int EndLine);
 
