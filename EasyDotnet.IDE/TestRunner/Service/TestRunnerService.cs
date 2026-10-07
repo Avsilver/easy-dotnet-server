@@ -770,6 +770,7 @@ public class TestRunnerService(
     if (!IsLatestSync(req))
       return new SyncFileResult([], req.Version);
 
+    var removedFileNodeIds = new HashSet<string>(StringComparer.Ordinal);
     foreach (var node in registry.GetNodesForFile(req.Path).ToList())
     {
       TestMethodLocation? loc;
@@ -793,7 +794,13 @@ public class TestRunnerService(
       if (loc is null)
       {
         if (isCSharp && !operationLock.IsLocked)
-          registry.RemoveSubtree(node.Id);
+        {
+          foreach (var removedId in registry.RemoveSubtree(node.Id))
+          {
+            if (removedFileNodeIds.Add(removedId))
+              await dispatcher.SendRemoveTestAsync(removedId);
+          }
+        }
         continue;
       }
 
@@ -861,6 +868,7 @@ public class TestRunnerService(
     foreach (var staleId in existingProbableIds)
     {
       if (newProbableIds.Contains(staleId)) continue;
+      if (operationLock.IsLocked) continue;
       registry.RemoveSubtree(staleId);
       await dispatcher.SendRemoveTestAsync(staleId);
     }
@@ -1115,7 +1123,7 @@ public class TestRunnerService(
   /// </summary>
   private string ResolveProbableSuccessor(
       string nodeId,
-      (string? FilePath, string? ParentId, string MethodName) snapshot)
+      (string? FilePath, string? ParentId, string MethodName, int? SignatureLine) snapshot)
   {
     if (snapshot.FilePath is null || snapshot.ParentId is null) return nodeId;
 
@@ -1123,14 +1131,21 @@ public class TestRunnerService(
     if (current is not null && current.Type is not NodeType.ProbableTest) return nodeId;
 
     var normalized = snapshot.FilePath.Replace('\\', '/');
-    var successor = registry.GetAll().FirstOrDefault(n =>
+    var candidates = registry.GetAll().Where(n =>
         (n.Type is NodeType.TestMethod or NodeType.TheoryGroup) &&
         n.ParentId == snapshot.ParentId &&
-        string.Equals(n.DisplayName, snapshot.MethodName, StringComparison.Ordinal) &&
         string.Equals(
             n.FilePath?.Replace('\\', '/'),
             normalized,
             StringComparison.OrdinalIgnoreCase));
+
+    var successor = candidates.FirstOrDefault(n => string.Equals(n.DisplayName, snapshot.MethodName, StringComparison.Ordinal));
+    if (successor is null && snapshot.SignatureLine is { } sourceLine)
+    {
+      var nearby = candidates.Where(n => n.SignatureLine is { } line && Math.Abs(line - sourceLine) <= 4).Take(2).ToList();
+      if (nearby.Count == 1)
+        successor = nearby[0];
+    }
 
     return successor?.Id ?? nodeId;
   }
@@ -1308,7 +1323,7 @@ public class TestRunnerService(
         ?? throw new InvalidOperationException($"Project {projectId} not found");
 
     var probableSnapshot = node.Type is NodeType.ProbableTest
-        ? (FilePath: node.FilePath, ParentId: node.ParentId, MethodName: node.DisplayName)
+        ? (FilePath: node.FilePath, ParentId: node.ParentId, MethodName: node.DisplayName, SignatureLine: node.SignatureLine)
         : default;
 
     await dispatcher.SendRunnerStatusAsync(BuildLoadingStatus("Building", OverallStatus.Building), token.OperationId);
